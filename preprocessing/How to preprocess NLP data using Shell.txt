@@ -1,0 +1,27 @@
+1. Execute 'terminal' in "Run as administrator". (Click on the Windows button and type "terminal".)
+2. Type "wsl -install". (launching Linux on your Windows)
+3. Move on to the directory where your data is stored.
+   Example: cd /mnt/c/Users
+4. How to concatenate text files?
+   Example: cat *.txt > corpus.tsv (if the separator is tab..)
+5. How to shuffle the data
+   Example: shuf corpus.tsv > corpus.shuf.tsv
+5. How to split a dataset into training, valid and test sets (You need to check the total number of lines first. Example: wc -l corpus.*)
+   Example: head -n 1200000 ./data/corpus.shuf.tsv > ./data/corpus.shuf.train.tsv ; tail -n 402418 ./data/corpus.shuf.tsv | head -n 200000 > ./data/corpus.shuf.valid.tsv
+            tail -n 202418 corpus.shuf.tsv > corpus.shuf.test.tsv
+   How to check? wc -l ./data/corpus.shuf.*
+6. How to split columns in a text file
+   Example: cut -f1 corpus.shuf.train.tsv > corpus.shuf.train.ko ; cut -f2 corpus.shuf.train.tsv > corpus.shuf.train.en
+            cut -f1 corpus.shuf.valid.tsv > corpus.shuf.valid.ko ; cut -f2 corpus.shuf.valid.tsv > corpus.shuf.valid.en
+            cut -f1 corpus.shuf.test.tsv > corpus.shuf.test.ko ; cut -f2 corpus.shuf.test.tsv > corpus.shuf.test.en
+7. Tokenization (mecab for Korean, ?? for English)
+   1) Refer to the followings in order to install mecab using Shell.
+      - mecab must be installed via the root user. (I don't know if it is correct, but I think it does at the moment..)
+      - Before installing mecab, refer to the following page.
+        https://medium.com/@juneoh/windows-10-64bit-%E1%84%8B%E1%85%A6%E1%84%89%E1%85%A5-pytorch-konlpy-mecab-%E1%84%89%E1%85%A5%E1%86%AF%E1%84%8E%E1%85%B5%E1%84%92%E1%85%A1%E1%84%80%E1%85%B5-4af8b049a178
+      - install_mecab_linux.sh (You can open this file using Notepad app.)
+      - splitting by blank in mecab: mecab -O wakati
+      - Korean: cat ./data/corpus.shuf.test.ko | mecab -O wakati -b 99999 | python ./post_tokenize.py ./data/corpus.shuf.test.ko > ./data/corpus.shuf.test.tok.ko
+      - English: cat ./data/corpus.shuf.test.en | python tokenizer.py | python post_tokenize.py ./data/corpus.shuf.test.en > ./data/corpus.shuf.test.tok.en
+
+8. Subword Segmentation
