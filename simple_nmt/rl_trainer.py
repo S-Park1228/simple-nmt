@@ -1,6 +1,7 @@
 from nltk.translate.gleu_score import sentence_gleu
 from nltk.translate.bleu_score import sentence_bleu
-from nltk.translate.bleu_score import SmoothingFunction
+from nltk.translate.bleu_score import SmoothingFunction # for more accurate BLEU calculation..
+                                                        # For more info, refer to NLTK.
 
 import numpy as np
 
@@ -49,7 +50,15 @@ class MinimumRiskTrainingEngine(MaximumLikelihoodEstimationEngine):
 
         # |y| = (batch_size, length1)
         # |y_hat| = (batch_size, length2)
+        # Note that length1 and length2 would be different each other. (or might be the same..)
+        # Both consist of one-hot indices, which means that they are long tensors.
 
+        # Note that we are supposed to apply BLEU after detokenizing y and y_hat via Mecab or Moses (NLTK).
+        # However, it is very difficulty to implement the process in Python, so we appy BLEU without detokenization due to slow speed.
+        # That is, we will obtain a kind of proxy BLEU values.
+        # This is the reason why _get_reward static method's default n_gram value is 6, which is bigger than the number
+        # we used to apply for BLEU, for example, 4.
+        # Search for more efficient codes than the below.
         with torch.no_grad():
             scores = []
 
@@ -87,12 +96,12 @@ class MinimumRiskTrainingEngine(MaximumLikelihoodEstimationEngine):
         # Memory inefficient but more readable version
         mask = indice == data_loader.PAD
         # |mask| = (batch_size, length)
-        indice = F.one_hot(indice, num_classes=output_size).float()
-        # |indice| = (batch_size, length, output_size)
-        log_prob = (y_hat * indice).sum(dim=-1)
+        indice = F.one_hot(indice, num_classes=output_size).float() # F: from torch.nn import functional as F
+        # |indice| = (batch_size, length, output_size) # memory inefficient!!!
+        log_prob = (y_hat * indice).sum(dim=-1) # elementwise multiplication of y_hat and indice
         # |log_prob| = (batch_size, length)
         log_prob.masked_fill_(mask, 0)
-        log_prob = log_prob.sum(dim=-1)
+        log_prob = log_prob.sum(dim=-1)  # Now, log_prob -> joint probabilities
         # |log_prob| = (batch_size, )
         '''
 
@@ -106,17 +115,17 @@ class MinimumRiskTrainingEngine(MaximumLikelihoodEstimationEngine):
 
         loss = (log_prob * -reward).sum()
         # Following two equations are eventually same.
-        # \theta = \theta - risk * \nabla_\theta \log{P}
-        # \theta = \theta - -reward * \nabla_\theta \log{P}
+        # $\theta = \theta - \nabla_\theta (risk * \log{P})$
+        # $\theta = \theta - \nabla_\theta (-reward * \log{P})$
         # where risk = -reward.
 
         return loss
 
     @staticmethod
-    def train(engine, mini_batch):
+    def train(engine, mini_batch): # It overrides the train method of MaximumLikelihoodEstimationEngine class in trainer.py.
         # You have to reset the gradients of all model parameters
         # before to take another step in gradient descent.
-        engine.model.train()
+        engine.model.train() # Turn on train mode.
         if engine.state.iteration % engine.config.iteration_per_update == 1 or \
             engine.config.iteration_per_update == 1:
             if engine.state.iteration > 1:
@@ -129,18 +138,20 @@ class MinimumRiskTrainingEngine(MaximumLikelihoodEstimationEngine):
         # Raw target variable has both BOS and EOS token.
         # The output of sequence-to-sequence does not have BOS token.
         # Thus, remove BOS token for reference.
-        x, y = mini_batch.src, mini_batch.tgt[0][:, 1:]
-        # |x| = (batch_size, length)
-        # |y| = (batch_size, length)
+        x, y = mini_batch.src, mini_batch.tgt[0][:, 1:] # [0] -> tensors (lengths not included)
+                                                        # [:, 1:] -> groundtruth (without <BOS>)
+        # |x| = (batch_size, max_length + 1)
+        # |y| = (batch_size, length??)
 
         # Take sampling process because set False for is_greedy.
-        y_hat, indice = engine.model.search(
+        y_hat, indice = engine.model.search( # |y_hat| = (batch_size, length, vocab_size)
+                                             # |indice| = (batch_size, length)
             x,
             is_greedy=False,
             max_length=engine.config.max_length
         )
 
-        with torch.no_grad():
+        with torch.no_grad(): # We don't have to calculate derivatives to obtain reward values.
             # Based on the result of sampling, get reward.
             actor_reward = MinimumRiskTrainingEngine._get_reward(
                 indice,
@@ -157,7 +168,7 @@ class MinimumRiskTrainingEngine(MaximumLikelihoodEstimationEngine):
             baseline = []
 
             for _ in range(engine.config.rl_n_samples):
-                _, sampled_indice = engine.model.search(
+                _, sampled_indice = engine.model.search( # In this case, we don't need y_hat values unlike sampling.
                     x,
                     is_greedy=False,
                     max_length=engine.config.max_length,

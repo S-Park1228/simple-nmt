@@ -28,7 +28,10 @@ class MaximumLikelihoodEstimationEngine(Engine):
         self.lr_scheduler = lr_scheduler
         self.config = config
 
-        super().__init__(func)
+        super().__init__(func) # SingleTrainer class will exploit this line.
+                               # For train_engine, func = MaximumLikelihoodEstimationEngine.train
+                               # For validation_engine, func = MaximumLikelihoodEstimationEngine.validate
+                               # You can apply this trick to other cases, so get used to it.
 
         self.best_loss = np.inf
         self.scaler = GradScaler()
@@ -45,33 +48,38 @@ class MaximumLikelihoodEstimationEngine(Engine):
                 engine.optimizer.zero_grad()
 
         device = next(engine.model.parameters()).device
-        mini_batch.src = (mini_batch.src[0].to(device), mini_batch.src[1])
-        mini_batch.tgt = (mini_batch.tgt[0].to(device), mini_batch.tgt[1])
+        mini_batch.src = (mini_batch.src[0].to(device), mini_batch.src[1]) # tensors and lenths
+        mini_batch.tgt = (mini_batch.tgt[0].to(device), mini_batch.tgt[1]) # tensors and lenths 
+                                                                           # the first column of tgt: <BOS>
+                                                                           # the last column of src: <EOS>
 
         # Raw target variable has both BOS and EOS token. 
         # The output of sequence-to-sequence does not have BOS token. 
         # Thus, remove BOS token for reference.
-        x, y = mini_batch.src, mini_batch.tgt[0][:, 1:]
-        # |x| = (batch_size, length)
-        # |y| = (batch_size, length)
+        x, y = mini_batch.src, mini_batch.tgt[0][:, 1:] # [0] -> tensors (lengths not included)
+                                                        # [:, 1:] -> groundtruth (without <BOS>)
+        # |x| = (batch_size, max_length + 1)
+        # |y| = (batch_size, length??)
 
         with autocast(not engine.config.off_autocast):
             # Take feed-forward
             # Similar as before, the input of decoder does not have EOS token.
             # Thus, remove EOS token for decoder input.
-            y_hat = engine.model(x, mini_batch.tgt[0][:, :-1])
+            y_hat = engine.model(x, mini_batch.tgt[0][:, :-1]) # input for Decoder (without <EOS>)
             # |y_hat| = (batch_size, length, output_size)
 
             loss = engine.crit(
                 y_hat.contiguous().view(-1, y_hat.size(-1)),
                 y.contiguous().view(-1)
             )
-            backward_target = loss.div(y.size(0)).div(engine.config.iteration_per_update)
+            # See get_crit function in train.py regarding the line below.
+            backward_target = loss.div(y.size(0)).div(engine.config.iteration_per_update) # the first div -> to apply mean
+                                                                                          # the second div -> due to grad accumulation
 
         if engine.config.gpu_id >= 0 and not engine.config.off_autocast:
             engine.scaler.scale(backward_target).backward()
         else:
-            backward_target.backward()
+            backward_target.backward() # Note that GradScaler only works in GPU.
 
         word_count = int(mini_batch.tgt[1].sum())
         p_norm = float(get_parameter_norm(engine.model.parameters()))
@@ -98,6 +106,9 @@ class MaximumLikelihoodEstimationEngine(Engine):
         return {
             'loss': loss,
             'ppl': ppl,
+            # Even though training process shows no problems, |param| can be shown as nan or inf.
+            # That is, we cannot apply mean to nan or inf.
+            # This is the reason why we need to take actions like below.
             '|param|': p_norm if not np.isnan(p_norm) and not np.isinf(p_norm) else 0.,
             '|g_param|': g_norm if not np.isnan(g_norm) and not np.isinf(g_norm) else 0.,
         }
@@ -280,24 +291,27 @@ class SingleTrainer():
                 engine.lr_scheduler.step()
 
         # Attach above call-back function.
+        # That is, the validation process is nothing but a call-back in the middle of training.
         train_engine.add_event_handler(
             Events.EPOCH_COMPLETED,
-            run_validation,
+            run_validation, # run_validation(validation_engine, valid_loader)
             validation_engine,
             valid_loader
         )
         # Attach other call-back function for initiation of the training.
         train_engine.add_event_handler(
             Events.STARTED,
-            self.target_engine_class.resume_training,
+            self.target_engine_class.resume_training, # self.target_engine_class.resume_training(self.config.init_epoch)
             self.config.init_epoch,
         )
 
-        # Attach validation loss check procedure for every end of validation epoch.
         validation_engine.add_event_handler(
             Events.EPOCH_COMPLETED, self.target_engine_class.check_best
         )
+        
         # Attach model save procedure for every end of validation epoch.
+        # This is because the lowest loss does not guarantee the best model.
+        # For more detailed reasons, learn the inference for NLG.
         validation_engine.add_event_handler(
             Events.EPOCH_COMPLETED,
             self.target_engine_class.save_model,

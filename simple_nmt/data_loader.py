@@ -15,7 +15,7 @@ class DataLoader():
     def __init__(self,
                  train_fn=None,
                  valid_fn=None,
-                 exts=None,
+                 exts=None, # 'ko' or 'en'y
                  batch_size=64,
                  device='cpu',
                  max_vocab=99999999,
@@ -50,6 +50,7 @@ class DataLoader():
         )
 
         if train_fn is not None and valid_fn is not None and exts is not None:
+            # TranslationDataset class is defined below.
             train = TranslationDataset(
                 path=train_fn,
                 exts=exts,
@@ -63,6 +64,10 @@ class DataLoader():
                 max_length=max_length,
             )
 
+            # data.BucketIterator fills pads and provides a collection of mini batches
+            # so that self.train_iter and self.valid_iter can be inserted in the run method of ignite.engine class.
+            # For more details, see the following URL.
+            # https://pytorch.org/ignite/generated/ignite.engine.engine.Engine.html#ignite.engine.engine.Engine.run
             self.train_iter = data.BucketIterator(
                 train,
                 batch_size=batch_size,
@@ -118,6 +123,7 @@ class TranslationDataset(data.Dataset):
         with open(src_path, encoding='utf-8') as src_file, open(trg_path, encoding='utf-8') as trg_file:
             for src_line, trg_line in zip(src_file, trg_file):
                 src_line, trg_line = src_line.strip(), trg_line.strip()
+                # If a sequence is longer than max_length, skip the current sequence and move on to the next one.
                 if max_length and max_length < max(len(src_line.split()), len(trg_line.split())):
                     continue
                 if src_line != '' and trg_line != '':
