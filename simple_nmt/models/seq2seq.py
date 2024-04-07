@@ -12,18 +12,22 @@ class Attention(nn.Module):
     def __init__(self, hidden_size):
         super(Attention, self).__init__()
 
-        self.linear = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.linear = nn.Linear(hidden_size, hidden_size, bias=False) # Note that we do not have to consider batch_first here.
+                                                                       # But, we must in the case of torch.nn.RNN or torch.nn.LSTM.
         self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, h_src, h_t_tgt, mask=None):
         # |h_src| = (batch_size, length, hidden_size)
+        # Note that h_src is the output, y, of Encoder class below. h_src's components are nothing but the hidden states by the last LSTM layer. 
         # |h_t_tgt| = (batch_size, 1, hidden_size)
         # |mask| = (batch_size, length)
 
         query = self.linear(h_t_tgt)
         # |query| = (batch_size, 1, hidden_size)
 
-        weight = torch.bmm(query, h_src.transpose(1, 2))
+        weight = torch.bmm(query, h_src.transpose(1, 2)) # torch.bmm: batchwise matrix multiplication
+                                                         # |query| = (batch_size, 1, hidden_size)
+                                                         # |h_src.transpose(1, 2)| = (batch_size, hidden_size, length)
         # |weight| = (batch_size, 1, length)
         if mask is not None:
             # Set each weight as -inf, if the mask value equals to 1.
@@ -31,11 +35,15 @@ class Attention(nn.Module):
             # masked weights would be set to 0 after softmax operation.
             # Thus, if the sample is shorter than other samples in mini-batch,
             # the weight for empty time-step would be set to 0.
-            weight.masked_fill_(mask.unsqueeze(1), -float('inf'))
+            weight.masked_fill_(mask.unsqueeze(1), -float('inf')) # |mask.unsqueeze(1)| = (batch_size, 1, length)
+                                                                  # The method, masked_fill_, applies inplace=True.
+                                                                  # This line fills -float('inf') to the values whose corresponding items in mask
+                                                                  # have 'True' values in the length dimension.
         weight = self.softmax(weight)
 
         context_vector = torch.bmm(weight, h_src)
         # |context_vector| = (batch_size, 1, hidden_size)
+        # So, context_vector is nothing but a weighted sum of all time-step values in each sequence.
 
         return context_vector
 
@@ -50,41 +58,44 @@ class Encoder(nn.Module):
         # because it is bidirectional.
         self.rnn = nn.LSTM(
             word_vec_size,
-            int(hidden_size / 2),
+            int(hidden_size / 2), # due to bidirectional RNN
             num_layers=n_layers,
             dropout=dropout_p,
             bidirectional=True,
-            batch_first=True,
+            batch_first=True, # default: False
         )
 
     def forward(self, emb):
-        # |emb| = (batch_size, length, word_vec_size)
+        # |emb| = (batch_size, max_length, word_vec_size)
+        # emb is already padded and sorted by length in a descending order.
 
+        # For further details regarding this if statement, see the Pytorch's pack_padded_sequence and pad.packed_demo.py.
+        # This statement is for reducing redundant memory usages caused by zero paddings.
+        # Note that self.train_iter and self.valid iter attributes converts sequences into sparsely represented input data
+        # for torch.nn.embedding class. In contrast, from the embedded tensors, the input data exist in the form of mini batches.
+        # Once the input data are embedded, we can remove redundant time-step values which are embedded from zero paddings.
+        # This is the reason why we apply pack_padded_sequence this step.
         if isinstance(emb, tuple):
-            x, lengths = emb
-            x = pack(x, lengths.tolist(), batch_first=True)
+            x, lengths = emb # A mini-batch may have sequences whose lengths are less than the maximum length of sequences.
+                             # lengths: a collection of lengths
+            x = pack(x, lengths.tolist(), batch_first=True) # the size of x: (batch size X the length of the longest sequence X )
+                                                            # Note that batch_first=True in this case.
+                                                            # There is one more argument: enforce_sorted. Its default value is True.
+                                                            # If the input date is not sorted by length in a decreasing order,
+                                                            # you must set it as False.
 
-            # Below is how pack_padded_sequence works.
-            # As you can see,
-            # PackedSequence object has information about mini-batch-wise information,
-            # not time-step-wise information.
-            # 
-            # a = [torch.tensor([1,2,3]), torch.tensor([3,4])]
-            # b = torch.nn.utils.rnn.pad_sequence(a, batch_first=True)
-            # >>>>
-            # tensor([[ 1,  2,  3],
-            #     [ 3,  4,  0]])
-            # torch.nn.utils.rnn.pack_padded_sequence(b, batch_first=True, lengths=[3,2]
-            # >>>>PackedSequence(data=tensor([ 1,  3,  2,  4,  3]), batch_sizes=tensor([ 2,  2,  1]))
         else:
             x = emb
 
         y, h = self.rnn(x)
         # |y| = (batch_size, length, hidden_size)
-        # |h[0]| = (num_layers * 2, batch_size, hidden_size / 2)
+        # Note that the last dimension is hidden_size because we need to consider both directions (forward and backward).
+        # |h[0]| = (num_layers * 2, batch_size, hidden_size / 2) -> hidden states
+        # FYI: |h[1]| = (num_layers * 2, batch_size, hidden_size / 2) -> cell states
+        # Note that the sizes of hidden states and cell states are the same in LSTM.
 
         if isinstance(emb, tuple):
-            y, _ = unpack(y, batch_first=True)
+            y, _ = unpack(y, batch_first=True) # For more details, see the Pytorch's pack_padded_sequence and pad.packed_demo.py.
 
         return y, h
 
@@ -96,11 +107,11 @@ class Decoder(nn.Module):
 
         # Be aware of value of 'batch_first' parameter and 'bidirectional' parameter.
         self.rnn = nn.LSTM(
-            word_vec_size + hidden_size,
+            word_vec_size + hidden_size, # Unlike Encoder, Decoder receives emb_tgt and h_t_1_tilde.
             hidden_size,
             num_layers=n_layers,
             dropout=dropout_p,
-            bidirectional=False,
+            bidirectional=False, # Unlike Encoder, Decoder must be unidirectional.
             batch_first=True,
         )
 
@@ -108,12 +119,14 @@ class Decoder(nn.Module):
         # |emb_t| = (batch_size, 1, word_vec_size)
         # |h_t_1_tilde| = (batch_size, 1, hidden_size)
         # |h_t_1[0]| = (n_layers, batch_size, hidden_size)
+        # FYI: h_t_1[0] is for hidden states and h_t_1[1] is for cell states.
         batch_size = emb_t.size(0)
         hidden_size = h_t_1[0].size(-1)
 
         if h_t_1_tilde is None:
             # If this is the first time-step,
-            h_t_1_tilde = emb_t.new(batch_size, 1, hidden_size).zero_()
+            h_t_1_tilde = emb_t.new(batch_size, 1, hidden_size).zero_() # By default, the returned tensor has the same torch.dtype
+                                                                        # and torch.device as emb_t.
 
         # Input feeding trick.
         x = torch.cat([emb_t, h_t_1_tilde], dim=-1)
@@ -137,6 +150,8 @@ class Generator(nn.Module):
 
         y = self.softmax(self.output(x))
         # |y| = (batch_size, length, output_size)
+        # We insert all time-step values simultaneously when it comes to training.
+        # However, we use Generator for each time-step when it comes to inference.
 
         # Return log-probability instead of just probability.
         return y
@@ -162,7 +177,7 @@ class Seq2Seq(nn.Module):
 
         super(Seq2Seq, self).__init__()
 
-        self.emb_src = nn.Embedding(input_size, word_vec_size)
+        self.emb_src = nn.Embedding(input_size, word_vec_size) # the size of the dictionary of embeddings
         self.emb_dec = nn.Embedding(output_size, word_vec_size)
 
         self.encoder = Encoder(
@@ -182,7 +197,7 @@ class Seq2Seq(nn.Module):
     def generate_mask(self, x, length):
         mask = []
 
-        max_length = max(length)
+        max_length = max(length) # length: a collection of lengths
         for l in length:
             if max_length - l > 0:
                 # If the length is shorter than maximum length among samples, 
@@ -195,10 +210,12 @@ class Seq2Seq(nn.Module):
                 # set every value in mask to be 0.
                 mask += [x.new_ones(1, l).zero_()]
 
-        mask = torch.cat(mask, dim=0).bool()
+        mask = torch.cat(mask, dim=0).bool() # |mask| = (batch_size, max_length)
 
         return mask
 
+    # We need this method because Encoder is bidirectional but Decoder is unidirectional.
+    # Note that Decoder receives Encoder's outputs as its hidden and cell states.
     def merge_encoder_hiddens(self, encoder_hiddens):
         new_hiddens = []
         new_cells = []
@@ -216,6 +233,7 @@ class Seq2Seq(nn.Module):
 
         return (new_hiddens, new_cells)
 
+    # This method implements the same thing as merge_encoder_hiddens, but it processes this task in a parallel manner.
     def fast_merge_encoder_hiddens(self, encoder_hiddens):
         # Merge bidirectional to uni-directional
         # We need to convert size from (n_layers * 2, batch_size, hidden_size / 2)
@@ -224,6 +242,8 @@ class Seq2Seq(nn.Module):
         h_0_tgt, c_0_tgt = encoder_hiddens
         batch_size = h_0_tgt.size(1)
 
+        # If you try using view method just once, you will find that it does not result in the tensor that you intend.
+        # This is the reason why you need to follow the commands below.
         h_0_tgt = h_0_tgt.transpose(0, 1).contiguous().view(batch_size,
                                                             -1,
                                                             self.hidden_size
@@ -246,7 +266,7 @@ class Seq2Seq(nn.Module):
         mask = None
         x_length = None
         if isinstance(src, tuple):
-            x, x_length = src
+            x, x_length = src # x_length: a collection of lengths
             # Based on the length information, gererate mask to prevent that
             # shorter sample has wasted attention.
             mask = self.generate_mask(x, x_length)
@@ -310,6 +330,9 @@ class Seq2Seq(nn.Module):
 
         return y_hat
 
+    # We can understand search method is like a function for inference.
+    # Note that we cannot use forward method for inference because the sequential inference does not guarantee the most likely sentence.
+    # It only guarantees the most likely inference for the next time-step.
     def search(self, src, is_greedy=True, max_length=255):
         if isinstance(src, tuple):
             x, x_length = src
@@ -327,8 +350,14 @@ class Seq2Seq(nn.Module):
         # Fill a vector, which has 'batch_size' dimension, with BOS value.
         y = x.new(batch_size, 1).zero_() + data_loader.BOS
 
-        is_decoding = x.new_ones(batch_size, 1).bool()
-        h_t_tilde, y_hats, indice = None, [], []
+        is_decoding = x.new_ones(batch_size, 1).bool() # Initialize the decoding status for the samples in a mini batch.
+                                                       # starting with True values..
+                                                       # After the decoding is finished,
+                                                       # the corresponding sample in a mini batch
+                                                       # will have a False value.
+        h_t_tilde, y_hats, indice = None, [], [] # h_t_tilde for LSTM inputs
+                                                 # y_hats for LSTM inputs
+                                                 # indice for detokenization (sparse representation to token)
         
         # Repeat a loop while sum of 'is_decoding' flag is bigger than 0,
         # or current time-step is smaller than maximum length.
@@ -346,7 +375,7 @@ class Seq2Seq(nn.Module):
                                                          context_vector
                                                          ], dim=-1)))
             y_hat = self.generator(h_t_tilde)
-            # |y_hat| = (batch_size, 1, output_size)
+            # |y_hat| = (batch_size, 1, output_size) -> multinomial log-probability distributions
             y_hats += [y_hat]
 
             if is_greedy:
@@ -358,19 +387,30 @@ class Seq2Seq(nn.Module):
                 # |y| = (batch_size, 1)
 
             # Put PAD if the sample is done.
-            y = y.masked_fill_(~is_decoding, data_loader.PAD)
+            y = y.masked_fill_(~is_decoding, data_loader.PAD) # Once a sample reaches <EOS> in the previous time step,
+                                                              # the indice from the current time step must be filled with paddings.
+                                                              # If you have difficulty in understanding it,
+                                                              # see the line just above the return command.
+                                                              # Note that even if <EOS> appears for a sample,
+                                                              # the search method does not terminated as long as is_decoding.sum() > 0
+                                                              # or len(indice) < max_length.
             # Update is_decoding if there is EOS token.
-            is_decoding = is_decoding * torch.ne(y, data_loader.EOS)
-            # |is_decoding| = (batch_size, 1)
-            indice += [y]
+            is_decoding = is_decoding * torch.ne(y, data_loader.EOS) # torch.ne -> not eqaul
+                                                                     # in case that the current step may result in <EOS>..
+                                                                     # |is_decoding| = (batch_size, 1)
+            indice += [y] # like adding a vector whose size is (batch_size, 1)..
+                          # If you have difficulty in understanding it, see the line just above the return command.
 
         y_hats = torch.cat(y_hats, dim=1)
         indice = torch.cat(indice, dim=1)
-        # |y_hat| = (batch_size, length, output_size)
+        # |y_hats| = (batch_size, length, output_size)
         # |indice| = (batch_size, length)
 
         return y_hats, indice
 
+    # We can understand batch_beam_search method is like a function for inference.
+    # Note that we cannot use forward method for inference because the sequential inference does not guarantee the most likely sentence.
+    # It only guarantees the most likely inference for the next time-step.    
     #@profile
     def batch_beam_search(
         self,
@@ -380,6 +420,9 @@ class Seq2Seq(nn.Module):
         n_best=1,
         length_penalty=.2
     ):
+        """
+        1. encoder part
+        """
         mask, x_length = None, None
 
         if isinstance(src, tuple):
@@ -395,18 +438,26 @@ class Seq2Seq(nn.Module):
         # |h_src| = (batch_size, length, hidden_size)
         h_0_tgt = self.fast_merge_encoder_hiddens(h_0_tgt)
 
+        """
+        2. BeamSearchBoard initialization
+        """
+        # the part different from search method
         # initialize 'SingleBeamSearchBoard' as many as batch_size
+        # SingleBeamSearchBoard in search.py -> args: device, prev_status_config, beam_size, max_length
         boards = [SingleBeamSearchBoard(
             h_src.device,
             {
+                # |h_0_tgt[0]| = (n_layers, batch_size, hidden_size)
                 'hidden_state': {
                     'init_status': h_0_tgt[0][:, i, :].unsqueeze(1),
                     'batch_dim_index': 1,
                 }, # |hidden_state| = (n_layers, batch_size, hidden_size)
+                # |h_0_tgt[1]| = (n_layers, batch_size, hidden_size)
                 'cell_state': {
                     'init_status': h_0_tgt[1][:, i, :].unsqueeze(1),
                     'batch_dim_index': 1,
                 }, # |cell_state| = (n_layers, batch_size, hidden_size)
+                # |h_t_1_tilde| = (batch_size, 1, hidden_size)
                 'h_t_1_tilde': {
                     'init_status': None,
                     'batch_dim_index': 0,
@@ -415,30 +466,43 @@ class Seq2Seq(nn.Module):
             beam_size=beam_size,
             max_length=max_length,
         ) for i in range(batch_size)]
-        is_done = [board.is_done() for board in boards]
+        done_cnt = [board.is_done() for board in boards] # board: corresponding to a single sample
 
-        length = 0
+        length = 0 # Initialize the length of time steps.
+        
+        """
+        3. Loop for beam search
+        """
         # Run loop while sum of 'is_done' is smaller than batch_size, 
         # or length is still smaller than max_length.
-        while sum(is_done) < batch_size and length <= max_length:
-            # current_batch_size = sum(is_done) * beam_size
-
+        # If done_cnt[a sample's index]=1, then it means that the sample's beam search is finished.
+        while sum(done_cnt) < batch_size and length <= max_length:
+            # current_batch_size = sum(is_done) * beam_size???
+            
+            '''
+            3.1. Creating temporary mini batches out of Boards
+            '''
             # Initialize fabricated variables.
             # As far as batch-beam-search is running, 
             # temporary batch-size for fabricated mini-batch is 
             # 'beam_size'-times bigger than original batch_size.
-            fab_input, fab_hidden, fab_cell, fab_h_t_tilde = [], [], [], []
-            fab_h_src, fab_mask = [], []
-            
+            fab_input, fab_hidden, fab_cell, fab_h_t_tilde = [], [], [], [] # fat_input for <BOS> and tgt (one-hot encoded)
+                                                                            # fab_hidden for hidden_states
+                                                                            # fab_cell for cell_states
+                                                                            # fab_h_t_tilde for the previous outputs
+            fab_h_src, fab_mask = [], [] # just increasing as many as beam_size for each sample
+                                         # Note that fab_h_src is for the outputs from Encoder.
+ 
             # Build fabricated mini-batch in non-parallel way.
             # This may cause a bottle-neck.
-            for i, board in enumerate(boards):
+            for i, board in enumerate(boards): # for each sample
                 # Batchify if the inference for the sample is still not finished.
-                if board.is_done() == 0:
-                    y_hat_i, prev_status = board.get_batch()
-                    hidden_i    = prev_status['hidden_state']
-                    cell_i      = prev_status['cell_state']
-                    h_t_tilde_i = prev_status['h_t_1_tilde']
+                if board.is_done() == 0: # Unlike search method, consider only those whose decodings are in progress.
+                    y_hat_i, prev_status = board.get_batch() # y_hat_i: the current time step's word indices as many as beam_size
+                                                             # |y_hat_i| = (beam_size, 1)
+                    hidden_i    = prev_status['hidden_state'] # expanded as many as beam_size via instantiation of a board
+                    cell_i      = prev_status['cell_state'] # expanded as many as beam_size via instantiation of a board
+                    h_t_tilde_i = prev_status['h_t_1_tilde'] # expanded as many as beam_size via instantiation of a board
 
                     fab_input  += [y_hat_i]
                     fab_hidden += [hidden_i]
@@ -451,13 +515,14 @@ class Seq2Seq(nn.Module):
                         fab_h_t_tilde = None
 
             # Now, concatenate list of tensors.
-            fab_input  = torch.cat(fab_input,  dim=0)
-            fab_hidden = torch.cat(fab_hidden, dim=1)
-            fab_cell   = torch.cat(fab_cell,   dim=1)
+            # Note that fab_input, fab_hidden, fab_cell, fab_h_scr and fab_mask are initialized for every loop.
+            fab_input  = torch.cat(fab_input,  dim=0) # concat beamwise -> beam_size * the number of samples
+            fab_hidden = torch.cat(fab_hidden, dim=1) # concat beamwise -> beam_size * the number of samples
+            fab_cell   = torch.cat(fab_cell,   dim=1) # concat beamwise -> beam_size * the number of samples
             fab_h_src  = torch.stack(fab_h_src)
             fab_mask   = torch.stack(fab_mask)
             if fab_h_t_tilde is not None:
-                fab_h_t_tilde = torch.cat(fab_h_t_tilde, dim=0)
+                fab_h_t_tilde = torch.cat(fab_h_t_tilde, dim=0) # concat beamwise -> beam_size * the number of samples
             # |fab_input|     = (current_batch_size, 1)
             # |fab_hidden|    = (n_layers, current_batch_size, hidden_size)
             # |fab_cell|      = (n_layers, current_batch_size, hidden_size)
@@ -465,6 +530,9 @@ class Seq2Seq(nn.Module):
             # |fab_mask|      = (current_batch_size, length)
             # |fab_h_t_tilde| = (current_batch_size, 1, hidden_size)
 
+            '''
+            3.2. Decoder
+            '''
             emb_t = self.emb_dec(fab_input)
             # |emb_t| = (current_batch_size, 1, word_vec_size)
 
@@ -481,12 +549,17 @@ class Seq2Seq(nn.Module):
             y_hat = self.generator(fab_h_t_tilde)
             # |y_hat| = (current_batch_size, 1, output_size)
 
+            '''
+            3.3. SoftMax and Splitting the output by board
+            3.4. calculating cumulative log probabilities -> collect_result method
+            3.5. calculating the top-k beams and recording them -> collect_result method
+            '''
             # separate the result for each sample.
             # fab_hidden[:, begin:end, :] = (n_layers, beam_size, hidden_size)
             # fab_cell[:, begin:end, :]   = (n_layers, beam_size, hidden_size)
             # fab_h_t_tilde[begin:end]    = (beam_size, 1, hidden_size)
             cnt = 0
-            for board in boards:
+            for board in boards: # for each sample
                 if board.is_done() == 0:
                     # Decide a range of each sample.
                     begin = cnt * beam_size
@@ -503,7 +576,7 @@ class Seq2Seq(nn.Module):
                     )
                     cnt += 1
 
-            is_done = [board.is_done() for board in boards]
+            done_cnt = [board.is_done() for board in boards]
             length += 1
 
         # pick n-best hypothesis.

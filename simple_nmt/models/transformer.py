@@ -14,18 +14,24 @@ class Attention(nn.Module):
 
     def forward(self, Q, K, V, mask=None, dk=64):
         # |Q| = (batch_size, m, hidden_size)
+            # However, it will practically receive Q whose size is (n_splits * batch_size, m, hidden_size / n_splits) like lines in MultiHead class.
         # |K| = |V| = (batch_size, n, hidden_size)
+            # However, it will practically receive K or V whose size is (n_splits * batch_size, m, hidden_size / n_splits) like lines in MultiHead class.
         # |mask| = (batch_size, m, n)
+            # However, it will practically receive a mask whose size is (n_splits * batch_size, m, n) like lines in MultiHead class.
 
         w = torch.bmm(Q, K.transpose(1, 2))
-        # |w| = (batch_size, m, n)
+        # |w| = (batch_size, m, n) -> Note that m = 1 in Seq2Seq models.
         if mask is not None:
             assert w.size() == mask.size()
             w.masked_fill_(mask, -float('inf'))
 
-        w = self.softmax(w / (dk**.5))
-        c = torch.bmm(w, V)
-        # |c| = (batch_size, m, hidden_size)
+        w = self.softmax(w / (dk**.5)) # scaled-dot attention for the more stable gradients
+                                       # more stable gradients as the probability distribution gets flatter
+                                       # Look up the internet for more information regarding the scaled-dot attention.
+        c = torch.bmm(w, V) # c: context
+                            # |V| = (batch_size, n, hidden_size), but practically (n_splits * batch_size, n, hidden_size / n_splits)
+        # |c| = (batch_size, m, hidden_size), but practically, (n_splits * batch_size, m, hidden_size / n_splits)
 
         return c
 
@@ -36,26 +42,40 @@ class MultiHead(nn.Module):
         super().__init__()
 
         self.hidden_size = hidden_size
-        self.n_splits = n_splits
+        self.n_splits = n_splits # the number of heads
 
         # Note that we don't have to declare each linear layer, separately.
-        self.Q_linear = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.K_linear = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.V_linear = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.linear = nn.Linear(hidden_size, hidden_size, bias=False)
+        # Q_linear, K_linear and V_linear -> trainable parameters regarding learning how to query
+        # Note that the following attributes are for the parallelized multi-head attention.
+        self.Q_linear = nn.Linear(hidden_size, hidden_size, bias=False) # the 2nd hidden_size = (hidden_size / n_splits) * n_splits
+        self.K_linear = nn.Linear(hidden_size, hidden_size, bias=False) # the 2nd hidden_size = (hidden_size / n_splits) * n_splits
+        self.V_linear = nn.Linear(hidden_size, hidden_size, bias=False) # the 2nd hidden_size = (hidden_size / n_splits) * n_splits
+        self.linear = nn.Linear(hidden_size, hidden_size, bias=False) # the 2nd hidden_size = (hidden_size / n_splits) * n_splits
 
         self.attn = Attention()
 
     def forward(self, Q, K, V, mask=None):
         # |Q|    = (batch_size, m, hidden_size)
-        # |K|    = (batch_size, n, hidden_size)
+        # |K|    = (batch_size, n, hidden_size) -> If self attention, m=n.
+                                                 # self attention in EncoderBLock -> The second dimension for Q and K is n.
+                                                 # self attention in DecoderBLock -> The second dimension for Q and K is m.
         # |V|    = |K|
-        # |mask| = (batch_size, m, n)
-
+        # |mask| = (batch_size, m, n) # three mask types
+                                      # self attention in EncoderBlock: mask needed to skip paddings, |mask| = (batch_size, n, n)
+                                      # attention (Decoder -> Encoder): mask needed to skip paddings, |mask| = (batch_size, m, n)
+                                          # Do not be confused m with n.
+                                          # Basically, Decoder queries Encoder, so m indicates the max length of target language,
+                                          # while n is the max length of source language.
+                                      # self attention in DecoderBlock: mask needed to prevent attention from referring to the future
+                                      # time steps, |mask| = (batch_size, m, m)
+        
+        # Refer to torch.tensor method. It returns a list composed of tensors.
         QWs = self.Q_linear(Q).split(self.hidden_size // self.n_splits, dim=-1)
         KWs = self.K_linear(K).split(self.hidden_size // self.n_splits, dim=-1)
         VWs = self.V_linear(V).split(self.hidden_size // self.n_splits, dim=-1)
+        # |QWs| = (batch_size, m, (hidden_size / n_splits) * n_splits)
         # |QW_i| = (batch_size, m, hidden_size / n_splits)
+        # |KWs| = |VWs| = (batch_size, n, (hidden_size / n_splits) * n_splits)
         # |KW_i| = |VW_i| = (batch_size, n, hidden_size / n_splits)
 
         # By concatenating splited linear transformed results,
@@ -64,8 +84,8 @@ class MultiHead(nn.Module):
         QWs = torch.cat(QWs, dim=0)
         KWs = torch.cat(KWs, dim=0)
         VWs = torch.cat(VWs, dim=0)
-        # |QWs| = (batch_size * n_splits, m, hidden_size / n_splits)
-        # |KWs| = |VWs| = (batch_size * n_splits, n, hidden_size / n_splits)
+        # Now, |QWs| = (batch_size * n_splits, m, hidden_size / n_splits)
+        # Now, |KWs| = |VWs| = (batch_size * n_splits, n, hidden_size / n_splits)
 
         if mask is not None:
             mask = torch.cat([mask for _ in range(self.n_splits)], dim=0)
@@ -79,7 +99,7 @@ class MultiHead(nn.Module):
         # |c| = (batch_size * n_splits, m, hidden_size / n_splits)
 
         # We need to restore temporal mini-batchfied multi-head attention results.
-        c = c.split(Q.size(0), dim=0)
+        c = c.split(Q.size(0), dim=0) # Q.size(0) = batch_size -> splitted tensors as many as n_splits
         # |c_i| = (batch_size, m, hidden_size / n_splits)
         c = self.linear(torch.cat(c, dim=-1))
         # |c| = (batch_size, m, hidden_size)
@@ -102,11 +122,13 @@ class EncoderBlock(nn.Module):
         self.attn_norm = nn.LayerNorm(hidden_size)
         self.attn_dropout = nn.Dropout(dropout_p)
 
+        # feed forward module in EncoderBlock
         self.fc = nn.Sequential(
             nn.Linear(hidden_size, hidden_size * 4),
             nn.LeakyReLU() if use_leaky_relu else nn.ReLU(),
             nn.Linear(hidden_size * 4, hidden_size),
         )
+        
         self.fc_norm = nn.LayerNorm(hidden_size)
         self.fc_dropout = nn.Dropout(dropout_p)
 
@@ -115,14 +137,15 @@ class EncoderBlock(nn.Module):
         # |mask| = (batch_size, n, n)
 
         # Post-LN:
-        # z = self.attn_norm(x + self.attn_dropout(self.attn(Q=x,
+        # z = self.attn_norm(x + self.attn_dropout(self.attn(Q=x, # Post!!!
         #                                                    K=x,
         #                                                    V=x,
         #                                                    mask=mask)))
         # z = self.fc_norm(z + self.fc_dropout(self.fc(z)))
 
         # Pre-LN:
-        z = self.attn_norm(x)
+        z = self.attn_norm(x) # Pre!!!
+        # Note that the plus operation below indicates a residual connection.
         z = x + self.attn_dropout(self.attn(Q=z,
                                             K=z,
                                             V=z,
@@ -160,16 +183,17 @@ class DecoderBlock(nn.Module):
         self.fc_norm = nn.LayerNorm(hidden_size)
         self.fc_dropout = nn.Dropout(dropout_p)
 
+    # Unlike Seq2Seq models, Transformer models do not require input feeding processes in Decoder, which is advantageous in terms of speed.
     def forward(self, x, key_and_value, mask, prev, future_mask):
-        # |key_and_value| = (batch_size, n, hidden_size)
+        # |key_and_value| = (batch_size, n, hidden_size), keys and values from Encoder
         # |mask|          = (batch_size, m, n)
 
         # In case of inference, we don't have to repeat same feed-forward operations.
         # Thus, we save previous feed-forward results.
-        if prev is None: # Training mode
+        if prev is None: # Training mode (All target language time steps IN at the same time!!!)
             # |x|           = (batch_size, m, hidden_size)
             # |prev|        = None
-            # |future_mask| = (batch_size, m, m)
+            # |future_mask| = (batch_size, m, m), preventing from seeing the future time steps
             # |z|           = (batch_size, m, hidden_size)
 
             # Post-LN:
@@ -182,10 +206,10 @@ class DecoderBlock(nn.Module):
             z = x + self.masked_attn_dropout(
                 self.masked_attn(z, z, z, mask=future_mask)
             )
-        else: # Inference mode
+        else: # Inference mode (target language time steps IN one by one!!!)
             # |x|           = (batch_size, 1, hidden_size)
-            # |prev|        = (batch_size, t - 1, hidden_size)
-            # |future_mask| = None
+            # |prev|        = (batch_size, t - 1, hidden_size) starting from the embedded <BOS>
+            # |future_mask| = None (due to the fact that future time steps will not be available..)
             # |z|           = (batch_size, 1, hidden_size)
 
             # Post-LN:
@@ -228,6 +252,9 @@ class MySequential(nn.Sequential):
 
     def forward(self, *x):
         # nn.Sequential class does not provide multiple input arguments and returns.
+        # However, we will insert mulitple inputs, which can be found in Transformer class. See Transformer.encoder and Transformer.decoder.
+        # Transformer.encoder's inputs: x, mask
+        # Transformer.decoder's inputs: x, key_and_value, mask, prev, future_mask
         # Thus, we need to define new class to solve this issue.
         # Note that each block has same function interface.
 
@@ -292,16 +319,17 @@ class Transformer(nn.Module):
 
     @torch.no_grad()
     def _generate_pos_enc(self, hidden_size, max_length):
-        enc = torch.FloatTensor(max_length, hidden_size).zero_()
+        enc = torch.FloatTensor(max_length, hidden_size).zero_() # Do not be confused with EncoderBlock.
+                                                                 # It means Sentence Embedding Matrix.
         # |enc| = (max_length, hidden_size)
 
-        pos = torch.arange(0, max_length).unsqueeze(-1).float()
-        dim = torch.arange(0, hidden_size // 2).unsqueeze(0).float()
+        pos = torch.arange(0, max_length).unsqueeze(-1).float() # column info of Setence Embedding Matrix
+        dim = torch.arange(0, hidden_size // 2).unsqueeze(0).float() # row info of Setence Embedding Matrix
         # |pos| = (max_length, 1)
         # |dim| = (1, hidden_size // 2)
 
-        enc[:, 0::2] = torch.sin(pos / 1e+4**dim.div(float(hidden_size)))
-        enc[:, 1::2] = torch.cos(pos / 1e+4**dim.div(float(hidden_size)))
+        enc[:, 0::2] = torch.sin(pos / 1e+4**dim.div(float(hidden_size))) # dimensions which are even numbers
+        enc[:, 1::2] = torch.cos(pos / 1e+4**dim.div(float(hidden_size))) # dimensions which are odd numbers
 
         return enc
 
@@ -311,9 +339,11 @@ class Transformer(nn.Module):
         assert x.size(-1) == self.pos_enc.size(-1)
         assert x.size(1) + init_pos <= self.max_length
 
-        pos_enc = self.pos_enc[init_pos:init_pos + x.size(1)].unsqueeze(0)
+        pos_enc = self.pos_enc[init_pos:init_pos + x.size(1)].unsqueeze(0) # x.size(1) = n
+                                                                           # training -> self.pos_enc[0:n]
+                                                                           # Else, init_pos must be given!!!
         # |pos_enc| = (1, n, hidden_size)
-        x = x + pos_enc.to(x.device)
+        x = x + pos_enc.to(x.device) # Since |x| = (batch_size, n, hidden_size), this line applies broadcasting.
 
         return x
 
@@ -321,7 +351,7 @@ class Transformer(nn.Module):
     def _generate_mask(self, x, length):
         mask = []
 
-        max_length = max(length)
+        max_length = max(length) # length: a list of lengths
         for l in length:
             if max_length - l > 0:
                 # If the length is shorter than maximum length among samples,
@@ -345,12 +375,12 @@ class Transformer(nn.Module):
 
         # Mask to prevent having attention weight on padding position.
         with torch.no_grad():
-            mask = self._generate_mask(x[0], x[1])
+            mask = self._generate_mask(x[0], x[1]) # x[1] length info
             # |mask| = (batch_size, n)
             x = x[0]
 
-            mask_enc = mask.unsqueeze(1).expand(*x.size(), mask.size(-1))
-            mask_dec = mask.unsqueeze(1).expand(*y.size(), mask.size(-1))
+            mask_enc = mask.unsqueeze(1).expand(*x.size(), mask.size(-1)) # (batch_size, n) -> (batch_size, 1, n) -> (batch_size, n, n)
+            mask_dec = mask.unsqueeze(1).expand(*y.size(), mask.size(-1)) # (batch_size, n) -> (batch_size, 1, n) -> (batch_size, m, n)
             # |mask_enc| = (batch_size, n, n)
             # |mask_dec| = (batch_size, m, n)
 
@@ -358,15 +388,18 @@ class Transformer(nn.Module):
         z, _ = self.encoder(z, mask_enc)
         # |z| = (batch_size, n, hidden_size)
 
-        # Generate future mask
+        # Generate future mask (future mask: for the self attention in DecoderBlock)
         with torch.no_grad():
-            future_mask = torch.triu(x.new_ones((y.size(1), y.size(1))), diagonal=1).bool()
+            future_mask = torch.triu(x.new_ones((y.size(1), y.size(1))), diagonal=1).bool() # triu: upper triangle
             # |future_mask| = (m, m)
             future_mask = future_mask.unsqueeze(0).expand(y.size(0), *future_mask.size())
-            # |fwd_mask| = (batch_size, m, m)
+            # |future_mask| = (batch_size, m, m)
 
         h = self.emb_dropout(self._position_encoding(self.emb_dec(y)))
-        h, _, _, _, _ = self.decoder(h, z, mask_dec, None, future_mask)
+        h, _, _, _, _ = self.decoder(h, z, mask_dec, None, future_mask) # mask_dec when it comes to referring to Encoder
+                                                                        # future_mask for self attention in Decoder
+                                                                        # Note that every time step refers to each other
+                                                                        # except for masked ones in training mode.
         # |h| = (batch_size, m, hidden_size)
 
         y_hat = self.generator(h)
@@ -385,7 +418,12 @@ class Transformer(nn.Module):
         mask_enc = mask.unsqueeze(1).expand(mask.size(0), x.size(1), mask.size(-1))
         mask_dec = mask.unsqueeze(1)
         # |mask_enc| = (batch_size, n, n)
-        # |mask_dec| = (batch_size, 1, n)
+        # |mask_dec| = (batch_size, 1, n) -> Unlike the feed-forward process of training,
+                                           # only one time step of target refers to Encoder.
+                                           # Thus, |mask_dec| = (batch_size, 1, n) instead of (batch_size, m, n).
+                                           # To the contrary, future_mask is not required
+                                           # since queries cannot refer to the future time steps during autoregressive inference.
+                                           # They can only refer to themselves and the past time steps.
 
         z = self.emb_dropout(self._position_encoding(self.emb_enc(x)))
         z, _ = self.encoder(z, mask_enc)
@@ -396,7 +434,7 @@ class Transformer(nn.Module):
         # |y_t_1| = (batch_size, 1)
         is_decoding = x.new_ones(batch_size, 1).bool()
 
-        prevs = [None for _ in range(len(self.decoder._modules) + 1)]
+        prevs = [None for _ in range(len(self.decoder._modules) + 1)] # It must be initialized for every mini batch.
         y_hats, indice = [], []
         # Repeat a loop while sum of 'is_decoding' flag is bigger than 0,
         # or current time-step is smaller than maximum length.
@@ -406,23 +444,31 @@ class Transformer(nn.Module):
             h_t = self.emb_dropout(
                 self._position_encoding(self.emb_dec(y_t_1), init_pos=len(indice))
             )
-            # |h_t| = (batch_size, 1, hidden_size))
+            # |h_t| = (batch_size, 1, hidden_size)
             if prevs[0] is None:
                 prevs[0] = h_t
             else:
-                prevs[0] = torch.cat([prevs[0], h_t], dim=1)
+                prevs[0] = torch.cat([prevs[0], h_t], dim=1) # Note that Decoder must remember all the past time steps
+                                                             # for self attention during inference mode.
 
-            for layer_index, block in enumerate(self.decoder._modules.values()):
+            for layer_index, block in enumerate(self.decoder._modules.values()): # MySequential._modules.values()
+                                                                                 # That is, nn.Module._modules.values()
+                                                                                 # -> a single DecoderBlock class
                 prev = prevs[layer_index]
                 # |prev| = (batch_size, len(y_hats), hidden_size)
 
-                h_t, _, _, _, _ = block(h_t, z, mask_dec, prev, None)
+                h_t, _, _, _, _ = block(h_t, z, mask_dec, prev, None) # While every time steps refers to each other except for masked ones
+                                                                      # in training mode,
+                                                                      # only current time step refers to the past time steps
+                                                                      # in inference mode.
                 # |h_t| = (batch_size, 1, hidden_size)
 
                 if prevs[layer_index + 1] is None:
                     prevs[layer_index + 1] = h_t
                 else:
-                    prevs[layer_index + 1] = torch.cat([prevs[layer_index + 1], h_t], dim=1)
+                    prevs[layer_index + 1] = torch.cat([prevs[layer_index + 1], h_t], dim=1) # Note that Decoder must remember
+                                                                                             # all the past time steps
+                                                                                             # for self attention during inference mode.
                 # |prev| = (batch_size, len(y_hats) + 1, hidden_size)
 
             y_hat_t = self.generator(h_t)
@@ -480,7 +526,8 @@ class Transformer(nn.Module):
 
         prev_status_config = {}
         for layer_index in range(n_dec_layers + 1):
-            prev_status_config['prev_state_%d' % layer_index] = {
+            prev_status_config['prev_state_%d' % layer_index] = { # %d <- layer_index
+                                                                  # 'prev_state_0': input's previous status (before the first layer)
                 'init_status': None,
                 'batch_dim_index': 0,
             }
@@ -523,7 +570,8 @@ class Transformer(nn.Module):
                     y_hat_i, prev_status = board.get_batch()
 
                     fab_input += [y_hat_i                 ]
-                    fab_z     += [z[i].unsqueeze(0)       ] * beam_size
+                    fab_z     += [z[i].unsqueeze(0)       ] * beam_size # |z[i]| = (n, hidden_size)
+                                                                        # |z[i].unsqueeze(0)| = (1, n, hidden_size)
                     fab_mask  += [mask_dec[i].unsqueeze(0)] * beam_size
 
                     for layer_index in range(n_dec_layers + 1):
@@ -540,10 +588,16 @@ class Transformer(nn.Module):
                 if fab_prev is not None:
                     fab_prevs[i] = torch.cat(fab_prev, dim=0)
             # |fab_input|    = (current_batch_size, 1,)
-            # |fab_z|        = (current_batch_size, n, hidden_size)
-            # |fab_mask|     = (current_batch_size, 1, n)
+            # |fab_z|        = (current_batch_size, n, hidden_size) -> for self attention in DecoderBlock
+            # |fab_mask|     = (current_batch_size, 1, n) -> for the DecoderBlock's attention referring to EncoderBlock
+                                                            # Note that the size of the same mask in training mode is
+                                                            # (batch_size, m, n)
+                                                            # Keep in mind that search is done for a single time step.
             # |fab_prevs[i]| = (current_batch_size, length, hidden_size)
+                                # Note that we need all the previous hidden states (for all layers), which is needed for
+                                # self attention steps in DecoderBlocks.
             # len(fab_prevs) = n_dec_layers + 1
+                               # 'prev_state_0': input's previous status (before the first layer)
 
             # Unlike training procedure,
             # take the last time-step's output during the inference.

@@ -4,6 +4,7 @@ import torch.nn as nn
 import simple_nmt.data_loader as data_loader
 
 
+# It is nothing but a Decoder in Seq2Seq models.
 class LanguageModel(nn.Module):
 
     def __init__(
