@@ -151,9 +151,13 @@ def main(config):
         batch_size=config.batch_size,
         device=-1,
         max_length=config.max_length,
-        dsl=True,
+        dsl=True, # x and y will be returned with both <BOS> and <EOS>.
+                  # Because even if either x or y does not need <BOS> or <EOS> in the first direction,
+                  # it will need them in another direction.
     )
 
+    # Unlike Seq2Seq models, src and tgt are not inputs and outputs.
+    # Rather, they are all domains.
     src_vocab_size = len(loader.src.vocab)
     tgt_vocab_size = len(loader.tgt.vocab)
 
