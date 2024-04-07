@@ -99,7 +99,7 @@ def to_text(indice, vocab):
                 # line += ['<EOS>']
                 break
             else:
-                line += [vocab.itos[index]]
+                line += [vocab.itos[index]] # itos method supported by torchtext
 
         line = ' '.join(line)
         lines += [line]
@@ -213,7 +213,7 @@ if __name__ == '__main__':
                 key=itemgetter(1),
                 reverse=True,
             )
-            sorted_lines    = [sorted_tuples[i][0] for i in range(len(sorted_tuples))]
+            sorted_lines    = [sorted_tuples[i][0] for i in range(len(sorted_tuples))] # still tokens that can be read by humans
             lengths         = [sorted_tuples[i][1] for i in range(len(sorted_tuples))]
             original_indice = [sorted_tuples[i][2] for i in range(len(sorted_tuples))]
 
@@ -221,7 +221,7 @@ if __name__ == '__main__':
             x = loader.src.numericalize(
                 loader.src.pad(sorted_lines),
                 device='cuda:%d' % config.gpu_id if config.gpu_id >= 0 else 'cpu'
-            )
+            ) # Through numericalize method, x becomes a tensor composed of one-hot representations.
             # |x| = (batch_size, length)
 
             if config.beam_size == 1:

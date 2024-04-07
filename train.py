@@ -5,6 +5,7 @@ import torch
 from torch import optim
 import torch.nn as nn
 
+# Install torch_optimizer via pip if needed.
 import torch_optimizer as custom_optim
 
 from simple_nmt.data_loader import DataLoader
@@ -224,6 +225,7 @@ def get_model(input_size, output_size, config):
             n_splits=config.n_splits,       # Number of head in Multi-head Attention.
             n_enc_blocks=config.n_layers,   # Number of encoder blocks
             n_dec_blocks=config.n_layers,   # Number of decoder blocks
+                                            # n_enc_blocks can be different from n_dec_blocks.
             dropout_p=config.dropout,       # Dropout rate on each block
         )
     else:
@@ -257,7 +259,8 @@ def get_crit(output_size, pad_index):
 def get_optimizer(model, config):
     if config.use_adam:
         if config.use_transformer:
-            optimizer = optim.Adam(model.parameters(), lr=config.lr, betas=(.9, .98))
+            optimizer = optim.Adam(model.parameters(), lr=config.lr, betas=(.9, .98)) # See Xiong et al., 2020 for more info
+                                                                                      # regarding beta values.
         else: # case of rnn based seq2seq.
             optimizer = optim.Adam(model.parameters(), lr=config.lr)
     elif config.use_radam:
@@ -287,21 +290,25 @@ def get_scheduler(optimizer, config):
 
 
 def main(config, model_weight=None, opt_weight=None):
+    
+    # configuration
     def print_config(config):
         pp = pprint.PrettyPrinter(indent=4)
         pp.pprint(vars(config))
     print_config(config)
 
+    # data loading
     loader = DataLoader(
         config.train,                           # Train file name except extention, which is language.
         config.valid,                           # Validation file name except extension.
-        (config.lang[:2], config.lang[-2:]),    # Source and target language.
+        (config.lang[:2], config.lang[-2:]),    # Source and target language. ('en' or 'ko')
         batch_size=config.batch_size,
         device=-1,                              # Lazy loading
         max_length=config.max_length,           # Loger sequence will be excluded.
         dsl=False,                              # Turn-off Dual-supervised Learning mode.
     )
 
+    # model
     input_size, output_size = len(loader.src.vocab), len(loader.tgt.vocab)
     model = get_model(input_size, output_size, config)
     crit = get_crit(output_size, data_loader.PAD)
@@ -340,6 +347,10 @@ def main(config, model_weight=None, opt_weight=None):
         lr_scheduler=lr_scheduler,
     )
 
+    # Note that we do not train our models using RL from scratch.
+    # We do after our models are trained via SingleTrainer(MaximumLikelihoodEstimationEngine, config) first.
+    # This is because we need to obtain plausible candidates first and apply RL. -> Apply RL finetuning to the MLE-pretrained model.
+    # Note that RL exploration is inefficient if there are way too many choices.
     if config.rl_n_epochs > 0:
         optimizer = optim.SGD(model.parameters(), lr=config.rl_lr)
         mrt_trainer = SingleTrainer(MinimumRiskTrainingEngine, config)
